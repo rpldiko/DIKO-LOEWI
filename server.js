@@ -8,6 +8,8 @@ const rateLimit = require("express-rate-limit");
 const bcrypt = require("bcryptjs");
 const PDFDocument = require("pdfkit");
 const path = require("path");
+const crypto = require("crypto");
+
 const {
   initDatabase,
   all,
@@ -22,7 +24,8 @@ const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const isProduction = process.env.NODE_ENV === "production";
 
-// Railway menggunakan reverse proxy untuk koneksi HTTPS.
+// Railway menggunakan reverse proxy.
+// Harus disetel sebelum middleware rate limiter.
 app.set("trust proxy", 1);
 
 if (
@@ -95,13 +98,18 @@ const loginLimiter = rateLimit({
   limit: 10,
   standardHeaders: "draft-7",
   legacyHeaders: false,
+
+  // Trust proxy sudah disetel di Express.
+  // Validasi header tetap aktif; jangan menonaktifkan
+  // validasi keamanan hanya untuk menyembunyikan error.
   message: {
-    error: "Terlalu banyak percobaan login. Coba lagi dalam 15 menit."
+    error:
+      "Terlalu banyak percobaan login. Coba lagi dalam 15 menit."
   }
 });
 
 function requireAdmin(req, res, next) {
-  if (!req.session.admin) {
+  if (!req.session || !req.session.admin) {
     return res.status(401).json({
       error: "Login admin diperlukan."
     });
@@ -115,11 +123,13 @@ function requireCsrf(req, res, next) {
 
   if (
     !token ||
+    !req.session ||
     !req.session.csrfToken ||
     token !== req.session.csrfToken
   ) {
     return res.status(403).json({
-      error: "Token keamanan tidak valid. Muat ulang halaman lalu coba lagi."
+      error:
+        "Token keamanan tidak valid. Muat ulang halaman lalu coba lagi."
     });
   }
 
@@ -154,9 +164,12 @@ function validInteger(value) {
 
 function rankingQuery() {
   return `
-    SELECT id, participant_number, name, level, points, created_at, updated_at
+    SELECT id, participant_number, name, level, points,
+           created_at, updated_at
     FROM participants
-    ORDER BY points DESC, name COLLATE NOCASE ASC, participant_number ASC
+    ORDER BY points DESC,
+             name COLLATE NOCASE ASC,
+             participant_number ASC
   `;
 }
 
@@ -165,94 +178,126 @@ function csvCell(value) {
   return '"' + str.replace(/"/g, '""') + '"';
 }
 
-// Memeriksa status login admin dan token CSRF.
+// ==============================
+// STATUS LOGIN
+// ==============================
+
 app.get("/api/status", (req, res) => {
+  res.set("Cache-Control", "no-store");
+
   res.json({
-    authenticated: Boolean(req.session.admin),
-    admin: req.session.admin
-      ? req.session.admin.username
-      : null,
-    csrfToken: req.session.csrfToken || null
+    authenticated: Boolean(req.session?.admin),
+    admin: req.session?.admin?.username || null,
+    csrfToken: req.session?.csrfToken || null
   });
 });
 
-// Login admin.
+// ==============================
+// LOGIN ADMIN
+// ==============================
+
 app.post("/api/login", loginLimiter, async (req, res) => {
-  const username =
-    typeof req.body.username === "string"
-      ? req.body.username.trim()
-      : "";
+  try {
+    const username =
+      typeof req.body.username === "string"
+        ? req.body.username.trim()
+        : "";
 
-  const password =
-    typeof req.body.password === "string"
-      ? req.body.password
-      : "";
+    const password =
+      typeof req.body.password === "string"
+        ? req.body.password
+        : "";
 
-  if (
-    !username ||
-    !password ||
-    username.length > 100 ||
-    password.length > 200
-  ) {
-    return res.status(400).json({
-      error: "Username dan password wajib diisi."
-    });
-  }
-
-  const admin = one(
-    "SELECT id, username, password_hash FROM admins WHERE username = ?",
-    [username]
-  );
-
-  const ok = admin
-    ? await bcrypt.compare(password, admin.password_hash)
-    : false;
-
-  if (!ok) {
-    return res.status(401).json({
-      error: "Username atau password salah."
-    });
-  }
-
-  req.session.regenerate((err) => {
-    if (err) {
-      return res.status(500).json({
-        error: "Gagal membuat sesi login."
+    if (
+      !username ||
+      !password ||
+      username.length > 100 ||
+      password.length > 200
+    ) {
+      return res.status(400).json({
+        error: "Username dan password wajib diisi."
       });
     }
 
-    req.session.admin = {
-      id: admin.id,
-      username: admin.username
-    };
+    const admin = one(
+      `SELECT id, username, password_hash
+       FROM admins WHERE username = ?`,
+      [username]
+    );
 
-    req.session.csrfToken = require("crypto")
-      .randomBytes(32)
-      .toString("hex");
+    const valid = admin
+      ? await bcrypt.compare(password, admin.password_hash)
+      : false;
 
-    audit(admin.id, "LOGIN", "Admin login");
+    if (!valid) {
+      return res.status(401).json({
+        error: "Username atau password salah."
+      });
+    }
 
-    req.session.save((saveErr) => {
-      if (saveErr) {
+    req.session.regenerate((err) => {
+      if (err) {
+        console.error("Gagal membuat sesi:", err);
+
         return res.status(500).json({
-          error: "Gagal menyimpan sesi login."
+          error: "Gagal membuat sesi login."
         });
       }
 
-      res.json({
-        ok: true,
-        admin: req.session.admin,
-        csrfToken: req.session.csrfToken
+      req.session.admin = {
+        id: admin.id,
+        username: admin.username
+      };
+
+      req.session.csrfToken = crypto
+        .randomBytes(32)
+        .toString("hex");
+
+      req.session.save((saveErr) => {
+        if (saveErr) {
+          console.error("Gagal menyimpan sesi:", saveErr);
+
+          return res.status(500).json({
+            error: "Gagal menyimpan sesi login."
+          });
+        }
+
+        try {
+          audit(admin.id, "LOGIN", "Admin login");
+        } catch (auditErr) {
+          console.error("Gagal mencatat audit login:", auditErr);
+        }
+
+        res.set("Cache-Control", "no-store");
+
+        return res.json({
+          ok: true,
+          admin: req.session.admin,
+          csrfToken: req.session.csrfToken
+        });
       });
     });
-  });
+  } catch (err) {
+    console.error("LOGIN ERROR:", err);
+
+    res.status(500).json({
+      error: "Terjadi kesalahan saat login."
+    });
+  }
 });
 
-// Logout admin.
+// ==============================
+// LOGOUT ADMIN
+// ==============================
+
 app.post("/api/logout", requireAdmin, requireCsrf, (req, res) => {
   const adminId = req.session.admin.id;
 
-  audit(adminId, "LOGOUT", "Admin logout");
+  try {
+    audit(adminId, "LOGOUT", "Admin logout");
+  } catch (err) {
+    console.error("Gagal mencatat logout:", err);
+  }
 
   req.session.destroy((err) => {
     if (err) {
@@ -271,7 +316,10 @@ app.post("/api/logout", requireAdmin, requireCsrf, (req, res) => {
   });
 });
 
-// Daftar peserta dan ranking.
+// ==============================
+// DAFTAR PESERTA
+// ==============================
+
 app.get("/api/participants", (req, res) => {
   const search =
     typeof req.query.search === "string"
@@ -323,9 +371,14 @@ app.get("/api/participants", (req, res) => {
   ).total;
 
   const rows = all(
-    "SELECT id, participant_number, name, level, points, created_at, updated_at FROM participants" +
-      clause +
-      " ORDER BY points DESC, name COLLATE NOCASE ASC, participant_number ASC LIMIT ? OFFSET ?",
+    `SELECT id, participant_number, name, level, points,
+            created_at, updated_at
+     FROM participants
+     ${clause}
+     ORDER BY points DESC,
+              name COLLATE NOCASE ASC,
+              participant_number ASC
+     LIMIT ? OFFSET ?`,
     [...params, limit, (page - 1) * limit]
   );
 
@@ -341,19 +394,24 @@ app.get("/api/participants", (req, res) => {
   });
 });
 
-// Daftar level yang tersedia.
+// ==============================
+// LEVEL DAN STATISTIK
+// ==============================
+
 app.get("/api/levels", (_req, res) => {
   res.json({
     levels: all(
-      "SELECT DISTINCT level FROM participants ORDER BY level COLLATE NOCASE"
+      `SELECT DISTINCT level FROM participants
+       ORDER BY level COLLATE NOCASE`
     ).map((x) => x.level)
   });
 });
 
-// Statistik ranking.
 app.get("/api/stats", (_req, res) => {
   const totals = one(
-    "SELECT COUNT(*) AS participants, COALESCE(MAX(points), 0) AS topPoints FROM participants"
+    `SELECT COUNT(*) AS participants,
+            COALESCE(MAX(points), 0) AS topPoints
+     FROM participants`
   );
 
   const levels = one(
@@ -367,7 +425,10 @@ app.get("/api/stats", (_req, res) => {
   });
 });
 
-// Riwayat perubahan poin.
+// ==============================
+// RIWAYAT POIN
+// ==============================
+
 app.get("/api/history", requireAdmin, (req, res) => {
   const participantId = parseInt(req.query.participantId, 10);
 
@@ -378,7 +439,8 @@ app.get("/api/history", requireAdmin, (req, res) => {
 
   const rows = Number.isInteger(participantId)
     ? all(
-        `SELECT h.*, p.name AS participant_name, a.username AS admin_username
+        `SELECT h.*, p.name AS participant_name,
+                a.username AS admin_username
          FROM point_history h
          LEFT JOIN participants p ON p.id = h.participant_id
          LEFT JOIN admins a ON a.id = h.admin_id
@@ -387,7 +449,8 @@ app.get("/api/history", requireAdmin, (req, res) => {
         [participantId, limit]
       )
     : all(
-        `SELECT h.*, p.name AS participant_name, a.username AS admin_username
+        `SELECT h.*, p.name AS participant_name,
+                a.username AS admin_username
          FROM point_history h
          LEFT JOIN participants p ON p.id = h.participant_id
          LEFT JOIN admins a ON a.id = h.admin_id
@@ -398,7 +461,10 @@ app.get("/api/history", requireAdmin, (req, res) => {
   res.json({ history: rows });
 });
 
-// Audit log admin.
+// ==============================
+// AUDIT LOG
+// ==============================
+
 app.get("/api/audit", requireAdmin, (_req, res) => {
   res.json({
     logs: all(
@@ -410,7 +476,10 @@ app.get("/api/audit", requireAdmin, (_req, res) => {
   });
 });
 
-// Tambah peserta.
+// ==============================
+// TAMBAH PESERTA
+// ==============================
+
 app.post(
   "/api/participants",
   requireAdmin,
@@ -437,12 +506,14 @@ app.post(
       "SELECT MAX(participant_number) AS n FROM participants"
     );
 
-    const number = (max && max.n ? max.n : 0) + 1;
+    const number = (max?.n || 0) + 1;
 
     try {
       const result = transaction(() => {
         const inserted = run(
-          "INSERT INTO participants (participant_number, name, level, points) VALUES (?, ?, ?, ?)",
+          `INSERT INTO participants
+           (participant_number, name, level, points)
+           VALUES (?, ?, ?, ?)`,
           [
             number,
             name.trim(),
@@ -454,7 +525,8 @@ app.post(
         if (points !== 0) {
           run(
             `INSERT INTO point_history
-             (participant_id, admin_id, old_points, change_amount, new_points, description)
+             (participant_id, admin_id, old_points,
+              change_amount, new_points, description)
              VALUES (?, ?, 0, ?, ?, ?)`,
             [
               inserted.lastInsertRowid,
@@ -482,8 +554,8 @@ app.post(
         ok: true,
         participant: result
       });
-    } catch (e) {
-      console.error("Gagal menambah peserta:", e);
+    } catch (err) {
+      console.error("Gagal menambah peserta:", err);
 
       res.status(400).json({
         error: "Gagal menambah peserta. Pastikan data valid."
@@ -492,7 +564,10 @@ app.post(
   }
 );
 
-// Edit nama dan level peserta.
+// ==============================
+// EDIT NAMA DAN LEVEL
+// ==============================
+
 app.put(
   "/api/participants/:id",
   requireAdmin,
@@ -535,7 +610,9 @@ app.put(
 
     transaction(() => {
       run(
-        "UPDATE participants SET name = ?, level = ?, updated_at = datetime('now') WHERE id = ?",
+        `UPDATE participants
+         SET name = ?, level = ?, updated_at = datetime('now')
+         WHERE id = ?`,
         [name.trim(), level.trim().toUpperCase(), id]
       );
 
@@ -550,7 +627,10 @@ app.put(
   }
 );
 
-// Tambah atau atur poin peserta.
+// ==============================
+// EDIT POIN
+// ==============================
+
 app.patch(
   "/api/participants/:id/points",
   requireAdmin,
@@ -599,13 +679,16 @@ app.patch(
 
     transaction(() => {
       run(
-        "UPDATE participants SET points = ?, updated_at = datetime('now') WHERE id = ?",
+        `UPDATE participants
+         SET points = ?, updated_at = datetime('now')
+         WHERE id = ?`,
         [newPoints, id]
       );
 
       run(
         `INSERT INTO point_history
-         (participant_id, admin_id, old_points, change_amount, new_points, description)
+         (participant_id, admin_id, old_points,
+          change_amount, new_points, description)
          VALUES (?, ?, ?, ?, ?, ?)`,
         [
           id,
@@ -636,7 +719,10 @@ app.patch(
   }
 );
 
-// Hapus peserta.
+// ==============================
+// HAPUS PESERTA
+// ==============================
+
 app.delete(
   "/api/participants/:id",
   requireAdmin,
@@ -662,14 +748,20 @@ app.delete(
         `ID ${id}: ${participant.name} (${participant.level}), poin ${participant.points}`
       );
 
-      run("DELETE FROM participants WHERE id = ?", [id]);
+      run(
+        "DELETE FROM participants WHERE id = ?",
+        [id]
+      );
     });
 
     res.json({ ok: true });
   }
 );
 
-// Export CSV.
+// ==============================
+// EXPORT CSV
+// ==============================
+
 app.get("/api/export.csv", requireAdmin, (_req, res) => {
   const rows = all(rankingQuery());
 
@@ -677,6 +769,7 @@ app.get("/api/export.csv", requireAdmin, (_req, res) => {
     ["Ranking", "No Peserta", "Nama", "Level", "Poin"]
       .map(csvCell)
       .join(","),
+
     ...rows.map((p, i) =>
       [
         i + 1,
@@ -700,7 +793,10 @@ app.get("/api/export.csv", requireAdmin, (_req, res) => {
   res.send("\uFEFF" + lines.join("\r\n"));
 });
 
-// Export PDF.
+// ==============================
+// EXPORT PDF
+// ==============================
+
 app.get("/api/export.pdf", requireAdmin, (_req, res) => {
   const rows = all(rankingQuery());
 
@@ -743,9 +839,11 @@ app.get("/api/export.pdf", requireAdmin, (_req, res) => {
   const xs = [42, 95, 240, 360, 475];
 
   ["RANK", "NO", "NAMA", "LEVEL", "POIN"].forEach(
-    (h, i) => doc.text(h, xs[i], y, {
-      width: i === 2 ? 110 : 65
-    })
+    (heading, i) => {
+      doc.text(heading, xs[i], y, {
+        width: i === 2 ? 110 : 65
+      });
+    }
   );
 
   y += 24;
@@ -771,8 +869,8 @@ app.get("/api/export.pdf", requireAdmin, (_req, res) => {
       p.name,
       p.level,
       p.points
-    ].forEach((v, j) => {
-      doc.text(String(v), xs[j], y, {
+    ].forEach((value, j) => {
+      doc.text(String(value), xs[j], y, {
         width: j === 2 ? 110 : 65
       });
     });
@@ -783,13 +881,20 @@ app.get("/api/export.pdf", requireAdmin, (_req, res) => {
   doc.end();
 });
 
-// Backup database.
+// ==============================
+// BACKUP DATABASE
+// ==============================
+
 app.get("/api/backup", requireAdmin, (_req, res) => {
   saveDatabase();
+
   res.download(DB_PATH, "loewi-race7-backup.db");
 });
 
-// Halaman utama.
+// ==============================
+// HALAMAN UTAMA / 404 API
+// ==============================
+
 app.get("*", (req, res, next) => {
   if (req.path.startsWith("/api/")) {
     return res.status(404).json({
@@ -805,7 +910,10 @@ app.get("*", (req, res, next) => {
   );
 });
 
-// Inisialisasi aplikasi dan database.
+// ==============================
+// START SERVER
+// ==============================
+
 (async () => {
   await initDatabase();
 
@@ -840,14 +948,16 @@ app.get("*", (req, res, next) => {
   if (!dbOne("SELECT id FROM participants LIMIT 1")) {
     const seed = require("./seed-data");
 
-    transaction(() =>
-      seed.forEach((p) =>
+    transaction(() => {
+      seed.forEach((p) => {
         dbRun(
-          "INSERT INTO participants (participant_number, name, level, points) VALUES (?, ?, ?, ?)",
+          `INSERT INTO participants
+           (participant_number, name, level, points)
+           VALUES (?, ?, ?, ?)`,
           p
-        )
-      )
-    );
+        );
+      });
+    });
   }
 
   app.listen(PORT, "0.0.0.0", () => {
