@@ -82,12 +82,14 @@ app.use(
       "dev-only-secret-change-this-before-deploy-32",
     resave: false,
     saveUninitialized: false,
-    cookie: {
-      httpOnly: true,
-      sameSite: "strict",
-      secure: isProduction,
-      maxAge: 1000 * 60 * 60 * 8
-    }
+    
+cookie: {
+  httpOnly: true,
+  sameSite: "lax",
+  secure: "auto",
+  maxAge: 1000 * 60 * 60 * 8
+}
+
   })
 );
 
