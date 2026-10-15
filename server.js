@@ -24,10 +24,10 @@ const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const isProduction = process.env.NODE_ENV === "production";
 
-// Railway menggunakan reverse proxy.
-// Harus disetel sebelum middleware rate limiter.
+// Railway reverse proxy
 app.set("trust proxy", 1);
 
+console.log("TRUST PROXY AKTIF:", app.get("trust proxy"));
 if (
   !process.env.SESSION_SECRET ||
   process.env.SESSION_SECRET.length < 32
